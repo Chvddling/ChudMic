@@ -31,6 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Get VB-CABLE driver pack (embedded in the exe)
+        working-directory: pc
+        run: curl.exe -L --fail -o vendor/VBCABLE_Driver_Pack.zip https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack46.zip
       - name: Build EXE
         working-directory: pc
         run: cargo build --release

@@ -83,7 +83,7 @@ pub fn local_ipv4() -> Option<Ipv4Addr> {
 }
 
 impl Net {
-    pub fn start(audio: Arc<AudioShared>) -> Net {
+    pub fn start(audio: Arc<AudioShared>, monitor: Arc<AudioShared>) -> Net {
         let state = Arc::new(Mutex::new(NetState::default()));
         let pc_name = pc_name();
         let mut errors = Vec::new();
@@ -94,7 +94,7 @@ impl Net {
                 let name = pc_name.clone();
                 thread::Builder::new()
                     .name("session".into())
-                    .spawn(move || session_loop(sock, st, audio, name))
+                    .spawn(move || session_loop(sock, st, [audio, monitor], name))
                     .expect("spawn session thread");
             }
             Err(e) => errors.push(format!(
@@ -150,9 +150,12 @@ impl Net {
 fn session_loop(
     sock: UdpSocket,
     state: Arc<Mutex<NetState>>,
-    audio: Arc<AudioShared>,
+    sinks: [Arc<AudioShared>; 2], // [virtual mic, "hear myself" monitor]
     pc_name: String,
 ) {
+    let audio = &sinks[0];
+    let clear_all = || sinks.iter().for_each(|a| a.clear());
+    let push_all = |x: &[f32]| sinks.iter().for_each(|a| a.push_samples(x));
     let _ = sock.set_read_timeout(Some(Duration::from_millis(50)));
     let mut buf = [0u8; 4096];
     let mut last_ping = Instant::now();
@@ -175,7 +178,7 @@ fn session_loop(
                 st.kick = false;
                 if let Some(s) = st.session.take() {
                     let _ = sock.send_to(&packet(T_BYE, &[]), s.addr);
-                    audio.clear();
+                    clear_all();
                 }
             }
             if st
@@ -184,7 +187,7 @@ fn session_loop(
                 .is_some_and(|s| now.duration_since(s.last_rx) > SESSION_TIMEOUT)
             {
                 st.session = None;
-                audio.clear();
+                clear_all();
             }
             if now.duration_since(last_ping) >= PING_EVERY {
                 last_ping = now;
@@ -227,7 +230,7 @@ fn session_loop(
                         last_rx: now,
                         last_seq: None,
                     });
-                    audio.clear();
+                    clear_all();
                     shifter.reset();
                     let _ = sock.send_to(&welcome, from);
                 } else {
@@ -258,12 +261,12 @@ fn session_loop(
                             shifting = false;
                             shifter.reset();
                         }
-                        audio.push_samples(&pcm);
+                        push_all(&pcm);
                     } else {
                         shifting = true;
                         shifted.clear();
                         shifter.process(&pcm, semitones, &mut shifted);
-                        audio.push_samples(&shifted);
+                        push_all(&shifted);
                     }
                 }
             }
@@ -276,7 +279,7 @@ fn session_loop(
             }
             T_BYE if ours => {
                 st.session = None;
-                audio.clear();
+                clear_all();
             }
             _ => {}
         }

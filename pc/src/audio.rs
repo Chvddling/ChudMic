@@ -16,6 +16,8 @@ const TARGET: usize = (SAMPLE_RATE as usize) * 60 / 1000; // 60 ms
 const MAX: usize = (SAMPLE_RATE as usize) * 250 / 1000; // 250 ms
 
 pub struct AudioBuf {
+    /// When false, incoming audio is ignored (used for the "Hear myself" monitor).
+    pub enabled: bool,
     q: VecDeque<f32>,
     playing: bool,
     pos: f64,
@@ -33,6 +35,7 @@ pub struct AudioShared(Mutex<AudioBuf>);
 impl AudioShared {
     pub fn new(volume: f32) -> Arc<Self> {
         Arc::new(AudioShared(Mutex::new(AudioBuf {
+            enabled: true,
             q: VecDeque::with_capacity(MAX + 4096),
             playing: false,
             pos: 0.0,
@@ -50,6 +53,9 @@ impl AudioShared {
     /// Append mono 48 kHz samples.
     pub fn push_samples(&self, samples: &[f32]) {
         let mut b = self.lock();
+        if !b.enabled {
+            return;
+        }
         b.q.extend(samples.iter().copied());
         if b.q.len() > MAX {
             let excess = b.q.len() - TARGET;
@@ -106,37 +112,66 @@ fn next_sample(b: &mut AudioBuf, ratio: f64) -> f32 {
     out
 }
 
-pub fn output_device_names() -> Vec<String> {
+/// ChudMic's playback side of the virtual cable ("ChudMic Feed", or
+/// "CABLE Input" before it is renamed).
+pub fn is_virtual_cable(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("cable input") || n.starts_with("chudmic feed")
+}
+
+/// True when Windows lists a recording device named "ChudMic".
+pub fn mic_is_named() -> bool {
     let host = cpal::default_host();
-    match host.output_devices() {
-        Ok(devs) => devs.filter_map(|d| d.name().ok()).collect(),
-        Err(_) => Vec::new(),
+    match host.input_devices() {
+        Ok(mut devs) => devs.any(|d| {
+            d.name()
+                .map(|n| n.to_lowercase().starts_with("chudmic ("))
+                .unwrap_or(false)
+        }),
+        Err(_) => false,
     }
 }
 
-pub fn is_virtual_cable(name: &str) -> bool {
-    name.to_lowercase().contains("cable input")
+pub fn cable_installed() -> bool {
+    find_cable().is_some()
 }
 
-/// Open the output stream. `wanted` = saved device name; falls back to VB-Cable, then the default device.
-pub fn start_output(
-    wanted: Option<&str>,
+fn find_cable() -> Option<cpal::Device> {
+    cpal::default_host()
+        .output_devices()
+        .ok()?
+        .find(|d| d.name().map(|n| is_virtual_cable(&n)).unwrap_or(false))
+}
+
+/// Play into the virtual cable, which apps see as the "ChudMic" microphone.
+/// Never falls back to speakers.
+pub fn start_cable_output(shared: Arc<AudioShared>) -> Result<(cpal::Stream, String), String> {
+    let device =
+        find_cable().ok_or_else(|| "The ChudMic microphone isn't set up yet.".to_string())?;
+    start_on(device, shared)
+}
+
+/// Play to the default speakers/headphones (the "Hear myself" monitor).
+pub fn start_monitor_output(shared: Arc<AudioShared>) -> Result<(cpal::Stream, String), String> {
+    let device = cpal::default_host()
+        .default_output_device()
+        .ok_or_else(|| "No speakers or headphones found.".to_string())?;
+    let name = device.name().unwrap_or_default();
+    if is_virtual_cable(&name) {
+        return Err(
+            "Windows' default speakers are set to the ChudMic Feed device. \
+                    Pick your real speakers in Sound settings."
+                .into(),
+        );
+    }
+    start_on(device, shared)
+}
+
+fn start_on(
+    device: cpal::Device,
     shared: Arc<AudioShared>,
 ) -> Result<(cpal::Stream, String), String> {
-    let host = cpal::default_host();
-    let find = |pred: &dyn Fn(&str) -> bool| -> Option<cpal::Device> {
-        host.output_devices()
-            .ok()?
-            .find(|d| d.name().map(|n| pred(&n)).unwrap_or(false))
-    };
-
-    let device = wanted
-        .and_then(|w| find(&|n: &str| n == w))
-        .or_else(|| find(&is_virtual_cable))
-        .or_else(|| host.default_output_device())
-        .ok_or_else(|| "No audio output device found".to_string())?;
     let name = device.name().unwrap_or_else(|_| "Unknown device".into());
-
     let supported = device
         .default_output_config()
         .map_err(|e| format!("{name}: {e}"))?;

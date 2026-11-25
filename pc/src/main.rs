@@ -5,10 +5,11 @@ mod audio;
 mod net;
 mod pitch;
 mod proto;
+mod vcable;
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -22,6 +23,11 @@ const RED: Color32 = Color32::from_rgb(200, 60, 60);
 const ORANGE: Color32 = Color32::from_rgb(230, 160, 50);
 
 fn main() -> eframe::Result<()> {
+    // Elevated helper mode (virtual mic setup), started by the GUI via a UAC prompt.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a.starts_with("--")) {
+        std::process::exit(vcable::elevated_main(&args));
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ChudMic")
@@ -36,12 +42,12 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-// ---------- settings (volume + output device), stored in %APPDATA%\ChudMic\settings.txt ----------
+// ---------- settings, stored in %APPDATA%\ChudMic\settings.txt ----------
 
 struct Settings {
     volume: f32,
     pitch: f32,
-    device: Option<String>,
+    hear_myself: bool,
 }
 
 fn settings_path() -> PathBuf {
@@ -56,7 +62,7 @@ fn load_settings() -> Settings {
     let mut s = Settings {
         volume: 100.0,
         pitch: 0.0,
-        device: None,
+        hear_myself: false,
     };
     if let Ok(text) = std::fs::read_to_string(settings_path()) {
         for line in text.lines() {
@@ -69,7 +75,7 @@ fn load_settings() -> Settings {
                             .clamp(-12.0, 12.0)
                             / 2.0
                     }
-                    "device" if !v.trim().is_empty() => s.device = Some(v.trim().to_string()),
+                    "hear_myself" => s.hear_myself = v.trim() == "1",
                     _ => {}
                 }
             }
@@ -84,10 +90,10 @@ fn save_settings(s: &Settings) {
         let _ = std::fs::create_dir_all(dir);
     }
     let text = format!(
-        "volume={}\npitch={}\ndevice={}\n",
+        "volume={}\npitch={}\nhear_myself={}\n",
         s.volume.round(),
         s.pitch,
-        s.device.clone().unwrap_or_default()
+        s.hear_myself as u8
     );
     let _ = std::fs::write(path, text);
 }
@@ -113,13 +119,21 @@ fn qr_image(text: &str) -> Option<egui::ColorImage> {
 
 // ---------- app ----------
 
+/// Result of the background virtual-mic setup: None while running.
+type SetupJob = Arc<Mutex<Option<Result<String, String>>>>;
+
 struct App {
     audio: Arc<AudioShared>,
+    monitor: Arc<AudioShared>,
     net: Net,
     stream: Option<cpal::Stream>,
-    out_name: String,
-    devices: Vec<String>,
-    audio_err: Option<String>,
+    monitor_stream: Option<cpal::Stream>,
+    monitor_err: Option<String>,
+    cable_ok: bool,
+    mic_named: bool,
+    device_checked: Instant,
+    setup: Option<SetupJob>,
+    setup_msg: Option<Result<String, String>>,
     settings: Settings,
     save_at: Option<Instant>,
     muted: bool,
@@ -133,14 +147,21 @@ impl App {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let settings = load_settings();
         let audio = AudioShared::new(settings.volume / 100.0);
-        let net = Net::start(audio.clone());
+        let monitor = AudioShared::new(settings.volume / 100.0);
+        monitor.lock().enabled = false;
+        let net = Net::start(audio.clone(), monitor.clone());
         let mut app = App {
             audio,
+            monitor,
             net,
             stream: None,
-            out_name: String::new(),
-            devices: audio::output_device_names(),
-            audio_err: None,
+            monitor_stream: None,
+            monitor_err: None,
+            cable_ok: false,
+            mic_named: false,
+            device_checked: Instant::now(),
+            setup: None,
+            setup_msg: None,
             settings,
             save_at: None,
             muted: false,
@@ -149,24 +170,59 @@ impl App {
             ip_checked: None,
             qr: None,
         };
-        let wanted = app.settings.device.clone();
-        app.open_output(wanted.as_deref());
+        app.check_devices();
+        let hear = app.settings.hear_myself;
+        app.set_monitor(hear);
         app
     }
 
-    fn open_output(&mut self, wanted: Option<&str>) {
-        self.stream = None; // stop the old stream first
-        match audio::start_output(wanted, self.audio.clone()) {
-            Ok((stream, name)) => {
+    /// Look for the virtual cable and (re)open the output into it.
+    fn check_devices(&mut self) {
+        self.device_checked = Instant::now();
+        self.cable_ok = audio::cable_installed();
+        self.mic_named = self.cable_ok && audio::mic_is_named();
+        self.stream = None;
+        if self.cable_ok {
+            if let Ok((stream, _)) = audio::start_cable_output(self.audio.clone()) {
                 self.stream = Some(stream);
-                self.out_name = name;
-                self.audio_err = None;
-            }
-            Err(e) => {
-                self.out_name.clear();
-                self.audio_err = Some(e);
             }
         }
+    }
+
+    /// Turn "Hear myself" on or off.
+    fn set_monitor(&mut self, on: bool) {
+        self.monitor_stream = None;
+        self.monitor_err = None;
+        self.monitor.clear();
+        if on {
+            match audio::start_monitor_output(self.monitor.clone()) {
+                Ok((stream, _)) => self.monitor_stream = Some(stream),
+                Err(e) => self.monitor_err = Some(e),
+            }
+        }
+        self.monitor.lock().enabled = on && self.monitor_stream.is_some();
+    }
+
+    /// Run the virtual-mic setup (or rename only) in the background.
+    fn start_setup(&mut self, rename_only: bool) {
+        let job: SetupJob = Arc::new(Mutex::new(None));
+        let out = job.clone();
+        std::thread::spawn(move || {
+            let result = if rename_only {
+                vcable::describe_exit(vcable::run_elevated("--rename"))
+            } else {
+                match vcable::prepare_pack() {
+                    Ok(dir) => vcable::describe_exit(vcable::run_elevated(&format!(
+                        "--setup \"{}\"",
+                        dir.display()
+                    ))),
+                    Err(e) => Err(e),
+                }
+            };
+            *out.lock().unwrap() = Some(result);
+        });
+        self.setup = Some(job);
+        self.setup_msg = None;
     }
 
     fn refresh_ip(&mut self, ctx: &egui::Context) {
@@ -216,6 +272,25 @@ impl eframe::App for App {
             self.level = b.level.max(self.level * 0.85);
             b.level = 0.0;
         }
+        {
+            let mut m = self.monitor.lock();
+            m.volume = self.settings.volume / 100.0;
+            m.muted = self.muted;
+        }
+        // Finished setup?
+        let finished = self.setup.as_ref().and_then(|j| j.lock().unwrap().take());
+        if let Some(result) = finished {
+            self.setup = None;
+            self.setup_msg = Some(result);
+            self.check_devices();
+        }
+        // Re-check for the virtual cable now and then until it shows up.
+        if !self.cable_ok
+            && self.setup.is_none()
+            && self.device_checked.elapsed() > Duration::from_secs(5)
+        {
+            self.check_devices();
+        }
         let (session, phones) = {
             let mut st = self.net.state();
             st.pc_muted = self.muted;
@@ -240,7 +315,11 @@ impl eframe::App for App {
                 // ----- connection -----
                 match &session {
                     Some(s) => {
-                        ui.label(RichText::new(format!("Connected to {}", s.name)).color(GREEN).size(16.0));
+                        ui.label(
+                            RichText::new(format!("Connected to {}", s.name))
+                                .color(GREEN)
+                                .size(16.0),
+                        );
                         ui.weak(s.addr.ip().to_string());
                         if s.phone_muted {
                             ui.colored_label(ORANGE, "The phone has muted its mic");
@@ -271,7 +350,11 @@ impl eframe::App for App {
                 ui.separator();
 
                 // ----- mute + volume -----
-                let (label, fill) = if self.muted { ("Unmute", Some(RED)) } else { ("Mute", None) };
+                let (label, fill) = if self.muted {
+                    ("Unmute", Some(RED))
+                } else {
+                    ("Mute", None)
+                };
                 if big_button(ui, label, fill) {
                     self.muted = !self.muted;
                 }
@@ -301,7 +384,9 @@ impl eframe::App for App {
                                     }
                                 }),
                         )
-                        .on_hover_text("Shift your voice up or down. Adds about 50 ms of delay when not 0.");
+                        .on_hover_text(
+                            "Shift your voice up or down. Adds about 50 ms of delay when not 0.",
+                        );
                     if r.changed() {
                         self.save_at = Some(Instant::now() + Duration::from_millis(600));
                     }
@@ -313,41 +398,71 @@ impl eframe::App for App {
                 ui.add(egui::ProgressBar::new(self.level.sqrt().min(1.0)));
                 ui.separator();
 
-                // ----- output device -----
-                ui.label("Send audio to:");
-                let mut chosen: Option<String> = None;
-                ui.horizontal(|ui| {
-                    let current = if self.out_name.is_empty() { "(none)" } else { self.out_name.as_str() };
-                    egui::ComboBox::new("output_device", "")
-                        .width(ui.available_width() - 70.0)
-                        .selected_text(current)
-                        .show_ui(ui, |ui| {
-                            for d in &self.devices {
-                                if ui.selectable_label(*d == self.out_name, d).clicked() {
-                                    chosen = Some(d.clone());
-                                }
-                            }
-                        });
-                    if ui.button("Refresh").clicked() {
-                        self.devices = audio::output_device_names();
+                // ----- virtual microphone -----
+                ui.label(RichText::new("Microphone for Windows & apps").strong());
+                if self.setup.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Setting up... click Yes on the Windows prompt.");
+                    });
+                } else if !self.cable_ok {
+                    ui.colored_label(ORANGE, "The ChudMic microphone isn't set up yet.");
+                    if big_button(
+                        ui,
+                        "Set up ChudMic microphone",
+                        Some(Color32::from_rgb(40, 110, 70)),
+                    ) {
+                        self.start_setup(false);
                     }
-                });
-                if let Some(d) = chosen {
-                    self.open_output(Some(&d));
-                    self.settings.device = Some(d);
-                    save_settings(&self.settings);
-                }
-                if let Some(e) = &self.audio_err {
-                    ui.colored_label(RED, e);
-                } else if audio::is_virtual_cable(&self.out_name) {
-                    ui.weak("In Discord, OBS, games etc. choose \"CABLE Output\" as your microphone.");
+                    ui.weak("One time only. Windows will ask for admin permission.");
+                } else if self.mic_named {
+                    ui.colored_label(
+                        GREEN,
+                        "Ready: choose \"ChudMic\" as your microphone in Discord, OBS, games...",
+                    );
                 } else {
                     ui.colored_label(
-                        ORANGE,
-                        "VB-Cable not selected: you'll hear the phone on this device, but apps won't \
-                         see it as a mic. Install VB-Cable and pick \"CABLE Input\".",
+                        GREEN,
+                        "Ready: the mic currently shows up as \"CABLE Output\".",
                     );
+                    if ui.button("Rename it to \"ChudMic\"").clicked() {
+                        self.start_setup(true);
+                    }
                 }
+                match &self.setup_msg {
+                    Some(Ok(m)) => {
+                        ui.colored_label(GREEN, m);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.weak("If your PC sound went quiet, pick your speakers again in");
+                            if ui.link("Sound settings").clicked() {
+                                vcable::open("ms-settings:sound");
+                            }
+                        });
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(RED, e);
+                    }
+                    None => {}
+                }
+                ui.add_space(4.0);
+                let mut hear = self.settings.hear_myself;
+                if ui
+                    .checkbox(&mut hear, "Hear myself (play the mic on my speakers)")
+                    .changed()
+                {
+                    self.settings.hear_myself = hear;
+                    self.set_monitor(hear);
+                    save_settings(&self.settings);
+                }
+                if let Some(e) = &self.monitor_err {
+                    ui.colored_label(ORANGE, e);
+                }
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    ui.weak("Virtual mic driver: VB-CABLE by VB-Audio, donationware.");
+                    ui.hyperlink_to("Support it at vb-cable.com", vcable::DONATE_URL);
+                });
 
                 // ----- QR -----
                 if session.is_none() {

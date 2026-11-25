@@ -32,6 +32,7 @@ set "PATH=%PATH%;%T%\mingw64\bin"
 
 rem ================= 2. Build the PC app =================
 echo [2/6] Building the PC app - first time takes a few minutes...
+if not exist "%ROOT%pc\vendor\VBCABLE_Driver_Pack.zip" curl -L --fail -o "%ROOT%pc\vendor\VBCABLE_Driver_Pack.zip" https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack46.zip
 pushd "%ROOT%pc"
 cargo build --release || (popd & goto fail)
 popd
