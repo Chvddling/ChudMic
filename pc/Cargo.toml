@@ -1,0 +1,16 @@
+[package]
+name = "chudmic"
+version = "1.0.0"
+edition = "2021"
+description = "Use your Android phone as a Wi-Fi microphone (PC receiver)"
+license = "MIT"
+
+[dependencies]
+eframe = "=0.29.1"
+cpal = "=0.15.3"
+qrcode = { version = "=0.14.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

@@ -1,0 +1,55 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+      - name: Build APK
+        working-directory: android
+        run: gradle assembleRelease --no-daemon --stacktrace
+      - name: Rename APK
+        run: cp android/app/build/outputs/apk/release/app-release.apk ChudMic.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChudMic-android
+          path: ChudMic.apk
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build EXE
+        working-directory: pc
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ChudMic-windows
+          path: pc/target/release/chudmic.exe
+
+  # Push a tag like v1.0.0 to publish both files as a GitHub Release.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ChudMic-android/ChudMic.apk
+            ChudMic-windows/chudmic.exe
