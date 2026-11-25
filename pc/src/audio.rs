@@ -116,7 +116,10 @@ fn next_sample(b: &mut AudioBuf, ratio: f64) -> f32 {
 /// "CABLE Input" before it is renamed).
 pub fn is_virtual_cable(name: &str) -> bool {
     let n = name.to_lowercase();
-    n.contains("cable input") || n.starts_with("chudmic feed")
+    n.contains("cable input")
+        || n.starts_with("chudmic feed")
+        // the "(VB-Audio Virtual Cable)" part never changes when the device is renamed
+        || n.contains("vb-audio virtual cable")
 }
 
 /// True when Windows lists a recording device named "ChudMic".

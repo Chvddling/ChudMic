@@ -110,6 +110,12 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 pub fn elevated_main(args: &[String]) -> i32 {
     match args.get(1).map(String::as_str) {
         Some("--setup") => {
+            // Already installed (e.g. a second click)? Then only fix the names.
+            if let Ok(n) = rename_endpoints() {
+                if n >= 2 {
+                    return OK;
+                }
+            }
             let Some(setup) = args
                 .get(2)
                 .and_then(|d| find_file(Path::new(d), "VBCABLE_Setup_x64.exe"))
@@ -152,9 +158,13 @@ pub fn rename_endpoints() -> Result<usize, String> {
     use windows::Win32::Media::Audio::{
         eCapture, eRender, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
     };
+    use windows::Win32::System::Com::StructuredStorage::{
+        PropVariantChangeType, PROPVAR_CHANGE_FLAGS,
+    };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READWRITE,
     };
+    use windows::Win32::System::Variant::VT_LPWSTR;
 
     let err = |e: windows::core::Error| e.to_string();
     unsafe {
@@ -176,8 +186,15 @@ pub fn rename_endpoints() -> Result<usize, String> {
                 if !iface.contains("VB-Audio Virtual Cable") {
                     continue;
                 }
+                // Windows stores device names as VT_LPWSTR. PROPVARIANT::from(&str)
+                // makes a VT_BSTR, which audio libraries (cpal) can't read back,
+                // so convert it to the type Windows expects.
+                let as_bstr = PROPVARIANT::from(new_name);
+                let mut value = PROPVARIANT::default();
+                PropVariantChangeType(&mut value, &as_bstr, PROPVAR_CHANGE_FLAGS(0), VT_LPWSTR)
+                    .map_err(err)?;
                 store
-                    .SetValue(&PKEY_Device_DeviceDesc, &PROPVARIANT::from(new_name))
+                    .SetValue(&PKEY_Device_DeviceDesc, &value)
                     .map_err(err)?;
                 store.Commit().map_err(err)?;
                 renamed += 1;
